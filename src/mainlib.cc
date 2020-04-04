@@ -30,6 +30,8 @@
 #endif
 #include <unicode/uversion.h>
 
+#include "base/internal/tracing.h"
+#include "thirdparty/scope_guard/scope_guard.hpp"
 #include "packages/core/dns.h"                   // for init_dns_event_base.
 #include "vm/vm.h"                               // for push_constant_string, etc
 #include "comm.h"                                // for init_user_conn
@@ -292,6 +294,9 @@ void init_win32() {
 }
 
 int driver_main(int argc, char **argv) {
+  Tracer::setThreadName("FluffOS Main Thread");
+  ScopedTracer _main_tracer(__PRETTY_FUNCTION__);
+
   // backward-cpp doesn't yet work on win32
 #ifndef _WIN32
   // register crash handlers
@@ -331,7 +336,11 @@ int driver_main(int argc, char **argv) {
        */
       switch (argv[i][1]) {
         case 'f': {
+          DEFER { Tracer::flush("trace_driver.json"); };
+          ScopedTracer _tracer(std::string(argv[i] + 2));
+
           debug_message("Calling master::flag(\"%s\")...\n", argv[i] + 2);
+
           push_constant_string(argv[i] + 2);
           auto ret = safe_apply_master_ob(APPLY_FLAG, 1);
           if (ret == (svalue_t *)-1 || ret == nullptr || MudOS_is_being_shut_down) {

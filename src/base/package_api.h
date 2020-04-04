@@ -15,6 +15,8 @@
 // details about machine
 #include "vm/vm.h"
 
+#include "interactive.h"
+
 // FIXME: apply_cache
 #include "vm/internal/base/apply_cache.h"
 

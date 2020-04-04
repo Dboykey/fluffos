@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <functional>
 
+#include "applies_table.autogen.h"
+#include "base/internal/tracing.h"
 #include "comm.h"  // add_vmessage FIXME: reverse API
-
-#ifdef ENABLE_DTRACE
-#include "tracing/tracing.autogen.h"
-#endif
+#include "thirdparty/scope_guard/scope_guard.hpp"
+#include "vm/internal/apply.h"
 #include "vm/internal/base/machine.h"
+#include "vm/internal/eval_limit.h"
+#include "vm/internal/master.h"
+#include "vm/internal/simulate.h"
+#include "vm/internal/simul_efun.h"
 #include "compiler/internal/icode.h"  // for PUSH_WHAT
 #include "compiler/internal/lex.h"    // for insstr, FIXME
 #include "packages/core/sprintf.h"    // FIXME
@@ -1166,6 +1170,7 @@ void push_control_stack(int frkind) {
   csp->function_index_offset = function_index_offset;
   csp->variable_index_offset = variable_index_offset;
   csp->defers = nullptr;
+  csp->trace_id.clear();
 }
 
 /*
@@ -1177,15 +1182,6 @@ extern int playerchanged;
 
 void pop_control_stack() {
   DEBUG_CHECK(csp == (control_stack - 1), "Popped out of the control stack\n");
-#ifdef ENABLE_DTRACE
-  if ((csp->framekind & FRAME_MASK) == FRAME_FUNCTION) {
-    if (FLUFFOS_LPC_RETURN_ENABLED()) {
-      FLUFFOS_LPC_RETURN(current_object->obname,
-                         current_prog->function_table[csp->fr.table_index].funcname,
-                         current_prog->filename);
-    }
-  }
-#endif
 #ifdef PROFILE_FUNCTIONS
   if ((csp->framekind & FRAME_MASK) == FRAME_FUNCTION) {
     long secs, usecs, dsecs;
@@ -1243,6 +1239,10 @@ void pop_control_stack() {
   fp = csp->fp;
   function_index_offset = csp->function_index_offset;
   variable_index_offset = csp->variable_index_offset;
+  if (!csp->trace_id.empty()) {
+    Tracer::end(csp->trace_id, "LPC Function");
+    csp->trace_id.clear();
+  }
   csp--;
 }
 
@@ -1342,24 +1342,6 @@ void push_constant_string(const char *p) {
   sp->u.string = p;
 }
 
-void do_trace_call(int offset) {
-  do_trace("Call direct ", current_prog->function_table[offset].funcname, " ");
-  if (TRACEHB) {
-    if (TRACETST(TRACE_ARGS)) {
-      int i, n;
-
-      n = current_prog->function_table[offset].num_arg;
-
-      add_vmessage(command_giver, " with %d arguments: ", n);
-      for (i = n - 1; i >= 0; i--) {
-        print_svalue(&sp[-i]);
-        add_message(command_giver, " ", 1);
-      }
-    }
-    add_message(command_giver, "\n", 1);
-  }
-}
-
 /*
  * Argument is the function to execute. If it is defined by inheritance,
  * then search for the real definition, and return it.
@@ -1446,18 +1428,6 @@ function_t *setup_new_frame(int findex) {
   } else {
     setup_variables(csp->num_local_variables, func_entry->num_local, func_entry->num_arg);
   }
-  if (CONFIG_INT(__RC_TRACE__)) {
-    tracedepth++;
-    if (TRACEP(TRACE_CALL)) {
-      do_trace_call(findex);
-    }
-  }
-#ifdef ENABLE_DTRACE
-  if (FLUFFOS_LPC_ENTRY_ENABLED()) {
-    FLUFFOS_LPC_ENTRY(current_object->obname, current_prog->function_table[findex].funcname,
-                      current_prog->filename);
-  }
-#endif
   return &current_prog->function_table[findex];
 }
 
@@ -1494,29 +1464,12 @@ function_t *setup_inherited_frame(int findex) {
 
   func_entry = current_prog->function_table + findex;
   csp->fr.table_index = findex;
-#ifdef PROFILE_FUNCTIONS
-  get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
-  current_prog->function_table[findex].calls++;
-#endif
-
   /* Remove excessive arguments */
   if (flags & FUNC_TRUE_VARARGS) {
     setup_varargs_variables(csp->num_local_variables, func_entry->num_local, func_entry->num_arg);
   } else {
     setup_variables(csp->num_local_variables, func_entry->num_local, func_entry->num_arg);
   }
-  if (CONFIG_INT(__RC_TRACE__)) {
-    tracedepth++;
-    if (TRACEP(TRACE_CALL)) {
-      do_trace_call(findex);
-    }
-  }
-#ifdef ENABLE_DTRACE
-  if (FLUFFOS_LPC_ENTRY_ENABLED()) {
-    FLUFFOS_LPC_ENTRY(csp->ob->obname, current_prog->function_table[findex].funcname,
-                      current_prog->filename);
-  }
-#endif
   return &current_prog->function_table[findex];
 }
 
@@ -1843,6 +1796,8 @@ static char *previous_pc[60];
 static int last;
 
 void eval_instruction(char *p) {
+  ScopedTracer _tracer(__PRETTY_FUNCTION__);
+
 #ifdef DEBUG
   int num_arg;
 #endif
@@ -1860,6 +1815,16 @@ void eval_instruction(char *p) {
   /* Next F_RETURN at this level will return out of eval_instruction() */
   csp->framekind |= FRAME_EXTERNAL;
   pc = p;
+
+  auto _current_line = get_line_number_if_any();
+  std::string trace_id =
+      ((csp->framekind & FRAME_MASK) == FRAME_FUNCTION
+           ? std::string(current_prog->function_table[csp->fr.table_index].funcname)
+           : std::string("")) +
+      " at " + _current_line;
+
+  ScopedTracer _lpc_tracer(trace_id, "LPC Top Level");
+
   while (true) {
     if (debug_level & DBG_LPC) {
       char *f;
@@ -1869,7 +1834,7 @@ void eval_instruction(char *p) {
       show_lpc_line(f, l);
     }
     instruction = EXTRACT_UCHAR(pc++);
-    if (CONFIG_INT(__RC_TRACE__) || CONFIG_INT(__RC_TRACE_CODE__)) {
+    if (CONFIG_INT(__RC_TRACE_CODE__)) {
       real_instruction = instruction;
       /* real EFUN is stored as an short after F_EFUN0 - F_EFUNV instructions */
       if (instruction >= F_EFUN0 && instruction <= F_EFUNV) {
@@ -1878,18 +1843,12 @@ void eval_instruction(char *p) {
           fatal("Error in icode.");
         }
       }
-      if (CONFIG_INT(__RC_TRACE_CODE__)) {
-        previous_instruction[last] = real_instruction;
-        previous_pc[last] = pc - 1;
-        stack_size[last] = sp - fp - csp->num_local_variables;
-        last = (last + 1) % (sizeof previous_instruction / sizeof(int));
-      }
-      if (CONFIG_INT(__RC_TRACE__)) {
-        if (TRACEP(TRACE_EXEC)) {
-          do_trace("Exec ", query_instr_name(real_instruction), "\n");
-        }
-      }
+      previous_instruction[last] = real_instruction;
+      previous_pc[last] = pc - 1;
+      stack_size[last] = sp - fp - csp->num_local_variables;
+      last = (last + 1) % (sizeof previous_instruction / sizeof(int));
     }
+
     if (outoftime) {
       debug_message("Eval interrupted: object %s cost limit reached, limit: %ld usec.\n",
                     current_object->obname, max_eval_cost);
@@ -2917,8 +2876,12 @@ void eval_instruction(char *p) {
         // happen!
         funp = setup_new_frame(offset);
         csp->pc = pc; /* The corrected return address */
-
         pc = current_prog->program + funp->address;
+        {
+          auto _current_line = get_line_number_if_any();
+          csp->trace_id = std::string(funp->funcname) + " at " + _current_line;
+          Tracer::begin(csp->trace_id, "LPC Function");
+        }
       } break;
       case F_CALL_INHERITED: {
         inherit_t *ip = current_prog->inherit + EXTRACT_UCHAR(pc++);
@@ -2941,6 +2904,12 @@ void eval_instruction(char *p) {
         funp = setup_inherited_frame(offset);
         csp->pc = pc;
         pc = current_prog->program + funp->address;
+
+        {
+          auto _current_line = get_line_number_if_any();
+          csp->trace_id = std::string(funp->funcname) + " at " + _current_line;
+          Tracer::begin(csp->trace_id, "LPC Function");
+        }
       } break;
       case F_COMPL:
         if (sp->type != T_NUMBER) {
@@ -3515,20 +3484,6 @@ void eval_instruction(char *p) {
         DEBUG_CHECK(sp != fp, "Bad stack at F_RETURN_ZERO\n");
         *sp = const0;
         pop_control_stack();
-        if (CONFIG_INT(__RC_TRACE__)) {
-          tracedepth--;
-          if (TRACEP(TRACE_RETURN)) {
-            do_trace("Return", "", "");
-            if (TRACEHB) {
-              if (TRACETST(TRACE_ARGS)) {
-                static char msg[] = "with value: 0";
-
-                add_message(command_giver, msg, sizeof(msg) - 1);
-              }
-              add_message(command_giver, "\n", 1);
-            }
-          }
-        }
         /* The control stack was popped just before */
         if (csp[1].framekind & (FRAME_EXTERNAL | FRAME_RETURNED_FROM_CATCH)) {
           return;
@@ -3558,21 +3513,6 @@ void eval_instruction(char *p) {
                      * maintained */
         }
         pop_control_stack();
-        if (CONFIG_INT(__RC_TRACE__)) {
-          tracedepth--;
-          if (TRACEP(TRACE_RETURN)) {
-            do_trace("Return", "", "");
-            if (TRACEHB) {
-              if (TRACETST(TRACE_ARGS)) {
-                char msg[] = " with value: ";
-
-                add_message(command_giver, msg, sizeof(msg) - 1);
-                print_svalue(sp);
-              }
-              add_message(command_giver, "\n", 1);
-            }
-          }
-        }
         /* The control stack was popped just before */
         if (csp[1].framekind & (FRAME_EXTERNAL | FRAME_RETURNED_FROM_CATCH)) {
           return;
@@ -3779,7 +3719,11 @@ void eval_instruction(char *p) {
         }
         num_arg = st_num_arg;
 
-        (*efun_table[instruction - EFUN_BASE])();
+        {
+          ScopedTracer _efun_tracer(instrs[instruction].name, "EFUN");
+
+          (*efun_table[instruction - EFUN_BASE])();
+        }
 
         if (expected_stack != sp) {
           fatal("Bad sp %p (should be %p) after calling efun '%s', num arg %d.\n", sp,
@@ -3826,6 +3770,7 @@ static void do_catch(char *pc, unsigned short new_pc_offset) {
 
   assign_svalue(&catch_value, &const1);
   try {
+    ScopedTracer _tracer("Catch", "LPC Catch");
     /* note, this will work, since csp->extern_call won't be used */
     eval_instruction(pc);
   } catch (const char *) {
@@ -3912,12 +3857,6 @@ void call___INIT(object_t *ob) {
 #endif
 
   tracedepth = 0;
-
-  if (CONFIG_INT(__RC_TRACE__)) {
-    if (TRACEP(TRACE_APPLY)) {
-      do_trace("Apply", "", "\n");
-    }
-  }
 
 #ifdef DEBUG
   expected_sp = sp;
@@ -4705,20 +4644,6 @@ int last_instructions() {
     i = (i + 1) % (sizeof previous_instruction / sizeof(int));
   } while (i != last);
   return last;
-}
-
-/* Generate a debug message to the user */
-void do_trace(const char *msg, const char *fname, const char *post) {
-  const char *objname;
-
-  if (!TRACEHB) {
-    return;
-  }
-  objname = TRACETST(TRACE_OBJNAME)
-                ? (current_object && current_object->obname ? current_object->obname : "??")
-                : "";
-  add_vmessage(command_giver, "*** %d %*s %s %s %s%s", tracedepth, tracedepth, "", msg, objname,
-               fname, post);
 }
 
 /*
